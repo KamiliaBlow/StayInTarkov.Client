@@ -21,6 +21,7 @@ using StayInTarkov.Networking;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
@@ -179,51 +180,60 @@ namespace StayInTarkov.Coop.Players
             if (!coopGameComponent.GameWorldGameStarted)
                 return null;
 
-            if (!OwnsDamageInstance(coopGameComponent, damageInfo))
-            {
-                ReceiveDamage(damageInfo.Damage, bodyPartType, damageInfo.DamageType, 0, 0);
-                return null;
-            }
+#if DEBUGDAMAGE
+            StayInTarkovHelperConstants.Logger.LogDebug($"{nameof(CoopPlayer)}:{nameof(ApplyShot)} {(SITMatchmaking.IsClient ? "client" : "server")} owns={OwnsDamageInstance(coopGameComponent, damageInfo)} shotId={shotId.GetHashCode()} type={damageInfo.DamageType} dmg={damageInfo.Damage} part={bodyPartType} armor={armorPlateCollider}");
+#endif
+
+            //if (!OwnsDamageInstance(coopGameComponent, damageInfo))
+            //{
+            //    ReceiveDamage(damageInfo.Damage, bodyPartType, damageInfo.DamageType, 0, 0);
+            //    return null;
+            //}
 
             return base.ApplyShot(damageInfo, bodyPartType, colliderType, armorPlateCollider, shotId);
         }
 
         /// <summary>
         /// Hybrid damage ownership model
-        /// Damage is owned by the client involved in the exchange, to ensure a good user experience
-        /// Team kill is owned by the player with the lowest ID
-        /// AI vs. AI is owned by the server
+        /// Damage (including TK) is owned by the initiator (AI = server)
         /// </summary>
+        /// <param name="coopGameComponent"></param>
         /// <param name="damageInfo"></param>
         /// <returns></returns>
-        private bool OwnsDamageInstance(SITGameComponent coopGameComponent, DamageInfo damageInfo)
+        protected bool OwnsDamageInstance(SITGameComponent coopGameComponent, DamageInfo damageInfo)
         {
+            // FIXME(belette) Player.IsAI does not seem reliable on the guest/client after the first couple of waves
+            // In other words, Player.IsAI will be set to false even for scavs and AI PMCs.
+            //var initiatorIsAI = initiator.IsAI;
+            //var targetIsAI = this.IsAI;
+
             var targetIsAI = !coopGameComponent.ProfileIdsUser.Contains(ProfileId);
 
             if (damageInfo.DamageType != EDamageType.Bullet)
             {
-                return (!targetIsAI && IsYourPlayer) || (targetIsAI && SITMatchmaking.IsServer);
+                return IsYourPlayer || (targetIsAI && SITMatchmaking.IsServer);
             }
 
             var initiator = damageInfo.Player.iPlayer;
-            // FIXME(belette) Player.IsAI does not seem reliable on the guest/client after the first couple of waves
-            // In other words, Player.IsAI will be set to false even for scavs and AI PMCs. Probably needs to be fixed in spawn replication packets.
-            //var initiatorIsAI = initiator.IsAI;
-            //var targetIsAI = this.IsAI;
             var initiatorIsAI = !coopGameComponent.ProfileIdsUser.Contains(initiator.ProfileId);
             var initiatorIsMe = initiator.IsYourPlayer;
-            var targetIsMe = IsYourPlayer;
 
-            if (targetIsMe)
+            if (initiatorIsAI)
             {
-                return initiatorIsAI || (this.ProfileId.CompareTo(initiator.ProfileId) < 0);
-            } else if (initiatorIsMe)
-            {
-                return targetIsAI || (initiator.ProfileId.CompareTo(this.ProfileId) < 0);
+                return SITMatchmaking.IsServer;
             } else
             {
-                return SITMatchmaking.IsServer && targetIsAI && initiatorIsAI;
+                return initiatorIsMe;
             }
+        }
+
+        public override void OnArmorPointsChanged(ArmorComponent armor, bool children = false)
+        {
+            base.OnArmorPointsChanged(armor, children);
+#if DEBUGDAMAGE
+            BepInLogger.LogDebug($"{nameof(OnArmorPointsChanged)} pending {armor.Repairable.Item.Template.Name}({armor.Repairable.Item.Id}) {armor.Repairable.Durability}/{armor.Repairable.MaxDurability}");
+#endif
+            PendingArmorUpdates.Add(armor.Repairable.Item.Id, armor.Repairable.Durability);
         }
 
         public override void ApplyDamageInfo(DamageInfo damageInfo, EBodyPart bodyPartType, EBodyPartColliderType colliderType, float absorbed)
@@ -234,10 +244,16 @@ namespace StayInTarkov.Coop.Players
             if (!coopGameComponent.GameWorldGameStarted)
                 return;
 
-            if (!OwnsDamageInstance(coopGameComponent, damageInfo))
-                return;
+#if DEBUGDAMAGE
+            StayInTarkovHelperConstants.Logger.LogDebug($"{nameof(CoopPlayer)}:{nameof(ApplyShot)} {(SITMatchmaking.IsClient ? "client" : "server")} owns={OwnsDamageInstance(coopGameComponent, damageInfo)} type={damageInfo.DamageType} dmg={damageInfo.Damage} part={bodyPartType}");
+#endif
 
-            SendDamageToAllClients(damageInfo, bodyPartType, colliderType, absorbed);
+            if (OwnsDamageInstance(coopGameComponent, damageInfo))
+            {
+                SendDamageToAllClients(ProfileId, damageInfo, bodyPartType, colliderType, absorbed, PendingArmorUpdates);
+            }
+
+            PendingArmorUpdates.Clear();
         }
 
         /// <summary>
@@ -247,10 +263,10 @@ namespace StayInTarkov.Coop.Players
         /// <param name="bodyPartType"></param>
         /// <param name="bodyPartColliderType"></param>
         /// <param name="absorbed"></param>
-        private void SendDamageToAllClients(DamageInfo damageInfo, EBodyPart bodyPartType, EBodyPartColliderType bodyPartColliderType, float absorbed)
+        private static void SendDamageToAllClients(string ProfileId, DamageInfo damageInfo, EBodyPart bodyPartType, EBodyPartColliderType bodyPartColliderType, float absorbed, Dictionary<string, float> pendingArmorUpdates)
         {
             ApplyDamagePacket damagePacket = new ApplyDamagePacket();
-            damagePacket.ProfileId = this.ProfileId;
+            damagePacket.ProfileId = ProfileId;
             damagePacket.Damage = damageInfo.Damage;
             damagePacket.DamageType = damageInfo.DamageType;
             damagePacket.BodyPart = bodyPartType;
@@ -273,6 +289,12 @@ namespace StayInTarkov.Coop.Players
                     damagePacket.AggressorWeaponTpl = damageInfo.Weapon.TemplateId;
                 }
             }
+
+            damagePacket.PendingArmorUpdates = pendingArmorUpdates;
+
+#if DEBUGDAMAGE
+            StayInTarkovHelperConstants.Logger.LogError($"{nameof(SendDamageToAllClients)} {(SITMatchmaking.IsClient ? "client" : "server")} sending damage packet {nameof(SendDamageToAllClients)} type={damagePacket.DamageType} dmg={damagePacket.Damage} hitpoint={damagePacket.Point} source={damagePacket.SourceId} Aggressor={damageInfo.Player?.iPlayer.Profile.Nickname}({damageInfo.Player?.iPlayer.Profile.ProfileId}) ArmorUpdates={pendingArmorUpdates?.Count}");
+#endif
             GameClient.SendData(damagePacket.Serialize());
 
             //Dictionary<string, object> packet = new();
@@ -343,8 +365,9 @@ namespace StayInTarkov.Coop.Players
                     fastBlur.Hit(MovementContext.PhysicalConditionIs(EPhysicalCondition.OnPainkillers) ? absorbedDamage : bodyPartType == EBodyPart.Head ? absorbedDamage * 6 : absorbedDamage * 3);
                 }
             }
-
-            BepInLogger.LogDebug($"{nameof(ApplyDamageInfo)}: profile={ProfileId} type={damageInfo.DamageType} dmg={damageInfo.Damage}");
+#if DEBUGDAMAGE
+            BepInLogger.LogDebug($"{nameof(ReceiveDamageFromServerCR)}: profile={ProfileId} type={damageInfo.DamageType} dmg={damageInfo.Damage}");
+#endif
             base.ApplyDamageInfo(damageInfo, bodyPartType, bodyPartColliderType, absorbed);
 
             yield break;
@@ -547,6 +570,29 @@ namespace StayInTarkov.Coop.Players
         public bool TriggerPressed { get; internal set; }
 
         private Vector2 LastRotationSent = Vector2.zero;
+        private readonly Dictionary<string, float> PendingArmorUpdates = [];
+
+        public override void Proceed(bool withNetwork, Callback<IController> callback, bool scheduled = true)
+        {
+            // Protection
+            if (this is CoopPlayerClient)
+            {
+                base.Proceed(withNetwork, callback, scheduled);
+                return;
+            }
+
+            base.Proceed(withNetwork, callback, scheduled);
+
+            // Extra unneccessary protection
+            if (this is CoopPlayer)
+            {
+                PlayerProceedEmptyHandsPacket emptyHandsPacket = new PlayerProceedEmptyHandsPacket(this.ProfileId, withNetwork, scheduled);
+                BepInLogger.LogDebug(emptyHandsPacket.ToJson());
+                GameClient.SendData(emptyHandsPacket.Serialize());
+            }
+        }
+
+      
 
         public override void Proceed(FoodClass foodDrink, float amount, Callback<IMedsController> callback, int animationVariant, bool scheduled = true)
         {
@@ -557,18 +603,40 @@ namespace StayInTarkov.Coop.Players
                 return;
             }
 
-            var startResource = foodDrink.FoodDrinkComponent.RelativeValue;
-            PostProceedData = new SITPostProceedData { PreviousAmount = startResource, UsedItem = foodDrink };
-
-            base.Proceed(foodDrink, amount, callback, animationVariant, scheduled);
-
-            // Extra unneccessary protection
-            if (this is CoopPlayer)
+            Func<MedsController> controllerFactory = () => MedsController.smethod_5<MedsController>(this, foodDrink, EBodyPart.Head, amount, animationVariant);
+            Process<MedsController, IMedsController> process = new Process<MedsController, IMedsController>(this, controllerFactory, foodDrink);
+            Action confirmCallback = delegate
             {
                 PlayerProceedFoodDrinkPacket foodDrinkPacket = new PlayerProceedFoodDrinkPacket(this.ProfileId, foodDrink.Id, foodDrink.TemplateId, amount, animationVariant, scheduled);
-                BepInLogger.LogDebug(foodDrinkPacket.ToJson());
+                //BepInLogger.LogDebug(foodDrinkPacket.ToJson());
                 GameClient.SendData(foodDrinkPacket.Serialize());
-            }
+            };
+            process.method_0(delegate (IResult result)
+            {
+                if (result.Succeed)
+                {
+                    confirmCallback();
+                }
+            }, callback, scheduled);
+
+            //var startResource = foodDrink.FoodDrinkComponent.RelativeValue;
+            //PostProceedData = new SITPostProceedData { PreviousAmount = startResource, UsedItem = foodDrink };
+
+            //base.Proceed(foodDrink, amount, callback, animationVariant, scheduled);
+
+            //// Extra unneccessary protection
+            //if (this is CoopPlayer)
+            //{
+            //    PlayerProceedFoodDrinkPacket foodDrinkPacket = new PlayerProceedFoodDrinkPacket(this.ProfileId, foodDrink.Id, foodDrink.TemplateId, amount, animationVariant, scheduled);
+            //    BepInLogger.LogDebug(foodDrinkPacket.ToJson());
+            //    GameClient.SendData(foodDrinkPacket.Serialize());
+            //}
+        }
+
+        public override void Proceed(Item item, Callback<IQuickUseController> callback, bool scheduled = true)
+        {
+            BepInLogger.LogDebug($"{nameof(CoopPlayer)}:{nameof(Proceed)}:{nameof(item)}:IQuickUseController");
+            base.Proceed(item, callback, scheduled);
         }
 
         public override void Proceed(MedsClass meds, EBodyPart bodyPart, Callback<IMedsController> callback, int animationVariant, bool scheduled = true)
@@ -616,28 +684,32 @@ namespace StayInTarkov.Coop.Players
             GameClient.SendData(packet.Serialize());
         }
 
-        public override void Proceed(Item item, Callback<IQuickUseController> callback, bool scheduled = true)
-        {
-            BepInLogger.LogDebug($"{nameof(CoopPlayer)}:{nameof(Proceed)}:{nameof(item)}:IQuickUseController");
-            base.Proceed(item, callback, scheduled);
-
-
-        }
+     
 
         public override void Proceed(Weapon weapon, Callback<IFirearmHandsController> callback, bool scheduled = true)
         {
-            Func<FirearmController> controllerFactory = ((!IsAI) ? ((Func<FirearmController>)(() => FirearmController.smethod_5<SITFirearmController>(this, weapon))) : ((Func<FirearmController>)(() => FirearmController.smethod_5<SITFirearmControllerAI>(this, weapon))));
+            Func<SITFirearmController> controllerFactory = ((!IsAI) ? ((Func<SITFirearmController>)(() => FirearmController.smethod_5<SITFirearmController>(this, weapon))) : ((Func<SITFirearmController>)(() => FirearmController.smethod_5<SITFirearmControllerAI>(this, weapon))));
             bool fastHide = false;
             if (_handsController is FirearmController firearmController)
             {
                 fastHide = firearmController.CheckForFastWeaponSwitch(weapon);
             }
-            new Process<FirearmController, IFirearmHandsController>(this, controllerFactory, weapon, fastHide).method_0(null, callback, scheduled);
-            PlayerProceedWeaponPacket weaponPacket = new PlayerProceedWeaponPacket();
-            weaponPacket.ProfileId = this.ProfileId;
-            weaponPacket.ItemId = weapon.Id;
-            weaponPacket.Scheduled = scheduled;
-            GameClient.SendData(weaponPacket.Serialize());
+            var process = new Process<SITFirearmController, IFirearmHandsController>(this, controllerFactory, weapon, fastHide);
+            Action confirmCallback = delegate
+            {
+                PlayerProceedWeaponPacket weaponPacket = new PlayerProceedWeaponPacket();
+                weaponPacket.ProfileId = this.ProfileId;
+                weaponPacket.ItemId = weapon.Id;
+                weaponPacket.Scheduled = scheduled;
+                GameClient.SendData(weaponPacket.Serialize());
+            };
+            process.method_0(delegate (IResult result)
+            {
+                if (result.Succeed)
+                {
+                    confirmCallback();
+                }
+            }, callback, scheduled);
         }
 
         public override void Proceed(KnifeComponent knife, Callback<IKnifeController> callback, bool scheduled = true)
@@ -677,9 +749,18 @@ namespace StayInTarkov.Coop.Players
                 }
 
             }, callback, scheduled);
-
-
         }
+
+        public override void Proceed<T>(Item item, Callback<GIController1> callback, bool scheduled = true)
+        {
+            base.Proceed<T>(item, callback, scheduled);
+
+            BepInLogger.LogDebug($"{nameof(CoopPlayer)}:{nameof(Proceed)}<T>");
+
+            Func<T> controllerFactory = () => UsableItemController.smethod_5<T>(this, item);
+            new Process<T, GIController1>(this, controllerFactory, item, fastHide: true).method_0(null, callback, scheduled);
+        }
+
 
         public override void DropCurrentController(Action callback, bool fastDrop, Item nextControllerItem = null)
         {
@@ -880,5 +961,26 @@ namespace StayInTarkov.Coop.Players
 
         }
 
+        public void ReceiveArmorDamageFromServer(Dictionary<string, float> pendingArmorUpdates)
+        {
+            List<ArmorComponent> putOnArmors = [];
+            this.Inventory.GetPutOnArmorsNonAlloc(putOnArmors);
+#if DEBUGDAMAGE
+            BepInLogger.LogDebug($"{nameof(CoopPlayer)}:{nameof(ReceiveArmorDamageFromServer)} applying {pendingArmorUpdates.Count} updates");
+#endif
+            foreach (var kv in pendingArmorUpdates)
+            {
+                var armorComp = putOnArmors.FirstOrDefault(x => x.Repairable.Item.Id == kv.Key);
+                if (armorComp != null)
+                {
+#if DEBUGDAMAGE
+                    BepInLogger.LogDebug($"{nameof(CoopPlayer)}:{nameof(ReceiveArmorDamageFromServer)} setting {armorComp.Repairable.Item.Template.Name}({kv.Key}) to {kv.Value}/{armorComp.Repairable.MaxDurability}");
+#endif
+                    armorComp.Repairable.Durability = kv.Value;
+                    armorComp.Buff.TryDisableComponent(armorComp.Repairable.Durability);
+                    armorComp.Item.RaiseRefreshEvent(false, false);
+                }
+            }
+        }
     }
 }

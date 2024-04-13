@@ -12,6 +12,7 @@ using EFT;
 using EFT.AssetsManager;
 using EFT.Bots;
 using EFT.CameraControl;
+using EFT.Counters;
 using EFT.EnvironmentEffect;
 using EFT.Game.Spawning;
 using EFT.InputSystem;
@@ -23,6 +24,7 @@ using EFT.UI.Screens;
 using EFT.Weather;
 using JsonType;
 using Newtonsoft.Json.Linq;
+using StayInTarkov.AkiSupport.Singleplayer.Utils.InRaid;
 using StayInTarkov.Configuration;
 using StayInTarkov.Coop.Components;
 using StayInTarkov.Coop.Components.CoopGameComponents;
@@ -260,7 +262,7 @@ namespace StayInTarkov.Coop.SITGameModes
                 StartCoroutine(ArmoredTrainTimeSync());
             }
 
-            StartCoroutine(ClientLoadingPinger());
+            clientLoadingPingerCoroutine = StartCoroutine(ClientLoadingPinger());
 
             var friendlyAIJson = AkiBackendCommunication.Instance.GetJson($"/coop/server/friendlyAI/{SITGameComponent.GetServerId()}");
             Logger.LogDebug(friendlyAIJson);
@@ -277,7 +279,7 @@ namespace StayInTarkov.Coop.SITGameModes
                     yield return waitSeconds;
 
                 // Send a message of nothing to keep the Socket Alive whilst loading
-                AkiBackendCommunication.Instance.PostDownWebSocketImmediately("CLIENT_LOADING_KEEP_ALIVE");
+                AkiBackendCommunication.Instance?.PingAsync();
 
                 yield return waitSeconds;
             }
@@ -317,13 +319,16 @@ namespace StayInTarkov.Coop.SITGameModes
 
                 if (GameTimer.StartDateTime.HasValue && GameTimer.SessionTime.HasValue)
                 {
-                    Dictionary<string, object> raidTimerDict = new()
-                    {
-                        { "serverId", coopGameComponent.ServerId },
-                        { "m", "RaidTimer" },
-                        { "sessionTime", (GameTimer.SessionTime - GameTimer.PastTime).Value.Ticks },
-                    };
-                    Networking.GameClient.SendData(raidTimerDict.ToJson());
+                    //Dictionary<string, object> raidTimerDict = new()
+                    //{
+                    //    { "serverId", coopGameComponent.ServerId },
+                    //    { "m", "RaidTimer" },
+                    //    { "sessionTime", (GameTimer.SessionTime - GameTimer.PastTime).Value.Ticks },
+                    //};
+                    //Networking.GameClient.SendData(raidTimerDict.ToJson());
+                    RaidTimerPacket packet = new RaidTimerPacket();
+                    packet.SessionTime = (GameTimer.SessionTime - GameTimer.PastTime).Value.Ticks;
+                    Networking.GameClient.SendData(packet.Serialize());
                 }
             }
         }
@@ -1156,7 +1161,7 @@ namespace StayInTarkov.Coop.SITGameModes
             Logger.LogInfo("vmethod_4.SessionRun");
 
             // No longer need this ping. Load complete and all other data should keep happening after this point.
-            StopCoroutine(ClientLoadingPinger());
+            StopCoroutine(clientLoadingPingerCoroutine);
             //GCHelpers.ClearGarbage(emptyTheSet: true, unloadAssets: false);
 
             var magazines = Profile_0.Inventory.AllRealPlayerItems.OfType<MagazineClass>().ToList();
@@ -1274,8 +1279,21 @@ namespace StayInTarkov.Coop.SITGameModes
             Logger.LogDebug($"{nameof(ExfiltrationPoint_OnCancelExtraction)} {point.Settings.Name} {point.Status}");
             ExtractingPlayers.Remove(player.ProfileId);
 
+
+            BackendConfigSettingsClass.BackendConfigSettingsClassExperience.BackendConfigSettingsClassMatchEnd matchEnd = Singleton<BackendConfigSettingsClass>.Instance.Experience.MatchEnd;
+
+
+            if (Profile_0.EftStats.SessionCounters.GetAllInt(new object[] { CounterTag.Exp }) > matchEnd.SurvivedExpRequirement ||
+                RaidTimeUtil.GetElapsedRaidSeconds() > matchEnd.SurvivedTimeRequirement)
+            {
+                MyExitStatus = (player.HealthController.IsAlive ? ExitStatus.MissingInAction : ExitStatus.Killed);
+            }
+            else
+            {
+                MyExitStatus = ExitStatus.Runner;
+            }
+
             MyExitLocation = null;
-            MyExitStatus = player.HealthController.IsAlive ? ExitStatus.MissingInAction : ExitStatus.Killed;
         }
 
         private void ExfiltrationPoint_OnStartExtraction(ExfiltrationPoint point, EFT.Player player)
@@ -1317,23 +1335,27 @@ namespace StayInTarkov.Coop.SITGameModes
                 EnabledCountdownExfils.Remove(point);
             }
 
-            // Propagate exfil point state to all players (useful for Countdown exfils, like car)
-            // We do not propagate NotPresent because clients are responsible to trigger their local exfils.
-            // A race condition would cause NotPresent to be received before clients can properly process the exfil logic
-            // because EFT's code clears ExfiltrationPoint.Entered upon setting NotPresent
-            if (prevStatus != curStatus && curStatus != EExfiltrationStatus.NotPresent && curStatus != EExfiltrationStatus.UncompleteRequirements)
+            // Paulov: Had to add this. Without a SITGameComponent, the ServerId is null when sending data. Therefore a Raid could fail and blank screen.
+            if (SITGameComponent.TryGetCoopGameComponent(out var coopGameComponent))
             {
-                UpdateExfiltrationPointPacket packet = new()
+                // Propagate exfil point state to all players (useful for Countdown exfils, like car)
+                // We do not propagate NotPresent because clients are responsible to trigger their local exfils.
+                // A race condition would cause NotPresent to be received before clients can properly process the exfil logic
+                // because EFT's code clears ExfiltrationPoint.Entered upon setting NotPresent
+                if (prevStatus != curStatus && curStatus != EExfiltrationStatus.NotPresent && curStatus != EExfiltrationStatus.UncompleteRequirements)
                 {
-                    PointName = point.Settings.Name,
-                    Command = curStatus,
-                    QueuedPlayers = point.QueuedPlayers
-                };
-                GameClient.SendData(packet.Serialize());
+                    UpdateExfiltrationPointPacket packet = new()
+                    {
+                        PointName = point.Settings.Name,
+                        Command = curStatus,
+                        QueuedPlayers = point.QueuedPlayers
+                    };
+                    GameClient.SendData(packet.Serialize());
+                }
             }
         }
 
-        public ExitStatus MyExitStatus { get; set; } = ExitStatus.Survived;
+        public ExitStatus MyExitStatus { get; set; } = ExitStatus.MissingInAction;
         public string MyExitLocation { get; set; } = null;
         public ISpawnSystem SpawnSystem { get; set; }
         public int MaxBotCount { get; private set; }
@@ -1524,7 +1546,7 @@ namespace StayInTarkov.Coop.SITGameModes
         private NonWavesSpawnScenario nonWavesSpawnScenario_0;
 
         private Func<EFT.Player, GamePlayerOwner> func_1;
-
+        private Coroutine clientLoadingPingerCoroutine;
 
         public new void method_6(string backendUrl, string locationId, int variantId)
         {
